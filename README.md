@@ -142,6 +142,14 @@ cr12306 transfer --help
 
 `--card` 输出 `--select` 选中的方案（默认第 1 套）为 Markdown，包括实际日期、目的地停留时间、席别筛选、查询时间与来源。它不能与 `--json` 或 `--structured` 同用；没有可选方案会报错。与 `--save-watch` 同用时，私有保存路径写到 stderr，不放入可分享的卡片正文。卡片不是车票，导出或分享前应自行检查行程信息。
 
+如需适合微信查看的 PNG，可以将结构化结果交给可选的 [travel-cli 图片渲染器](https://github.com/scieszk/travel-cli)。安装该工具的 Pillow 和中文字体后，在本项目目录运行：
+
+```sh
+node dist/cli.js roundtrip 北京南 天津 --min-stay 360 --structured | python ../travel-cli/card_image.py --kind rail --input - --select 1 --output .private/rail.png
+```
+
+渲染器离线生成往返时刻、目的地停留和余票卡片，保留原查询时间；PNG 不是车票，余票以下单时为准。它失败时返回非零退出码与 `ok:false` JSON；普通铁路查询不需要 Python 或 Pillow。通过 Bot 发送时要调用实际附件接口，不能把本地路径当作发送成功；图片失败仍应保留文字结果。生成图片不要提交 Git。
+
 ### 私有偏好
 
 偏好默认保存在 `~/.config/cr12306/preferences.json`，可用 `CR12306_PREFERENCES` 指定其他路径。文件只接受 `seat`、`minWait`、`maxWait`、`earliest`、`latest`，不保存路线、身份或凭据。
