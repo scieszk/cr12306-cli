@@ -5,6 +5,7 @@
 
 import { parseTicketObject } from './parse.js';
 import type { TicketInfo } from './parse.js';
+import { CliError } from './errors.js';
 
 export const API_BASE = 'https://kyfw.12306.cn';
 export const SEARCH_BASE = 'https://search.12306.cn';
@@ -13,34 +14,78 @@ const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 let cachedCookie: string | null = null;
+let cookieRequest: Promise<string> | null = null;
+let cachedTicketPath: string | null = null;
+
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function ensure(condition: unknown): asserts condition {
+  if (!condition) throw new CliError('UPSTREAM_INVALID_RESPONSE');
+}
+
+function validateEnvelope(value: unknown): void {
+  ensure(record(value));
+  if (value.status !== undefined) ensure(typeof value.status === 'boolean');
+  if (value.status === false || (value.httpstatus !== undefined && String(value.httpstatus) !== '200') || value.errorMsg) {
+    throw new CliError('UPSTREAM_REJECTED');
+  }
+}
+
+async function readJson<T>(response: Response, validate = true): Promise<T> {
+  let value: unknown;
+  try { value = await response.json(); }
+  catch (error) {
+    if (error instanceof SyntaxError) throw new CliError('UPSTREAM_INVALID_RESPONSE');
+    throw error;
+  }
+  if (validate) validateEnvelope(value);
+  return value as T;
+}
+
+/** Only these relative endpoint names may be appended to our fixed official origin. */
+function ticketPath(value: unknown): string | null {
+  return typeof value === 'string' && /^leftTicket\/query[A-Za-z]{0,8}$/.test(value) ? value : null;
+}
 
 /** Abort covers both response headers and body consumption. */
 function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
-  return fetch(url, { ...init, signal: AbortSignal.timeout(15_000) });
+  return fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(15_000) });
 }
 
 /** 打 leftTicket/init 拿会话 cookie（RAIL_DEVICEID / RAIL_EXPIRATION） */
 export async function getCookie(): Promise<string> {
-  if (cachedCookie) return cachedCookie;
+  if (cachedCookie !== null) return cachedCookie;
+  if (!cookieRequest) cookieRequest = initializeSession();
+  try { return await cookieRequest; }
+  finally { cookieRequest = null; }
+}
+
+async function initializeSession(): Promise<string> {
   const res = await fetchWithTimeout(`${API_BASE}/otn/leftTicket/init`, {
     headers: { 'User-Agent': UA },
-    redirect: 'follow',
   });
+  if (!res.ok) throw new CliError('UPSTREAM_HTTP_ERROR');
   const setCookies =
     (res.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() ??
     [];
   const cookie = setCookies.map((c) => c.split(';')[0]).join('; ');
-  cachedCookie = cookie || 'RAIL_DEVICEID=cr12306cli';
+  // Parse the string assignment, never execute the upstream script.
+  const html = await res.text();
+  const hint = html.match(/\bCLeftTicketUrl\s*=\s*(['"])([^'"\r\n]{1,64})\1/)?.[2];
+  cachedTicketPath = ticketPath(hint);
+  cachedCookie = cookie;
   return cachedCookie;
 }
 
-async function request<T>(url: string, params: Record<string, string>, useCookie = true): Promise<T> {
+async function request<T>(url: string, params: Record<string, string>, validate = true): Promise<T> {
   const qs = new URLSearchParams(params).toString();
   const headers: Record<string, string> = { 'User-Agent': UA };
-  if (useCookie) headers['Cookie'] = await getCookie();
+  headers['Cookie'] = await getCookie();
   const res = await fetchWithTimeout(`${url}?${qs}`, { headers });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
-  return (await res.json()) as T;
+  if (!res.ok) throw new CliError('UPSTREAM_HTTP_ERROR');
+  return readJson<T>(res, validate);
 }
 
 /** POST 表单请求（12306 部分接口只接受 POST） */
@@ -51,8 +96,8 @@ async function postForm<T>(url: string, params: Record<string, string>): Promise
     Cookie: await getCookie(),
   };
   const res = await fetchWithTimeout(url, { method: 'POST', headers, body: new URLSearchParams(params).toString() });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
-  return (await res.json()) as T;
+  if (!res.ok) throw new CliError('UPSTREAM_HTTP_ERROR');
+  return readJson<T>(res);
 }
 
 /* ---------- 车站电报码 ---------- */
@@ -61,7 +106,7 @@ export async function fetchStationNameJs(): Promise<string> {
   const res = await fetchWithTimeout(`${API_BASE}/otn/resources/js/framework/station_name.js`, {
     headers: { 'User-Agent': UA },
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} fetching station_name.js`);
+  if (!res.ok) throw new CliError('UPSTREAM_HTTP_ERROR');
   return res.text();
 }
 
@@ -70,6 +115,7 @@ export async function fetchStationNameJs(): Promise<string> {
 export interface LeftTicketsResponse {
   status?: boolean;
   messages?: string;
+  c_url?: string;
   data?: {
     result?: string[];
     map?: Record<string, string>;
@@ -82,23 +128,45 @@ export async function queryLeftTickets(
   fromTele: string,
   toTele: string
 ): Promise<LeftTicketsResponse> {
-  // 接口名在 query / queryA / queryG / queryZ 之间横跳过，逐个尝试
-  const variants = ['leftTicket/queryG', 'leftTicket/queryA', 'leftTicket/query'];
-  let lastErr: unknown = null;
-  for (const path of variants) {
+  await getCookie();
+  const variants = [...(cachedTicketPath ? [cachedTicketPath] : []), 'leftTicket/queryG', 'leftTicket/queryA', 'leftTicket/query'];
+  const tried = new Set<string>();
+  let acceptedHint = false;
+  let lastErr: unknown = new CliError('UPSTREAM_INVALID_RESPONSE');
+  while (variants.length && tried.size < 5) {
+    const path = variants.shift()!;
+    if (tried.has(path)) continue;
+    tried.add(path);
     try {
       const r = await request<LeftTicketsResponse>(`${API_BASE}/otn/${path}`, {
         'leftTicketDTO.train_date': date,
         'leftTicketDTO.from_station': fromTele,
         'leftTicketDTO.to_station': toTele,
         purpose_codes: 'ADULT',
-      });
-      if (r?.data?.result) return r;
+      }, false);
+      const hint = record(r) ? ticketPath(r.c_url) : null;
+      if (!acceptedHint && hint && !tried.has(hint)) {
+        acceptedHint = true;
+        variants.unshift(hint);
+      }
+      validateEnvelope(r);
+      ensure(record(r.data) && Array.isArray(r.data.result));
+      ensure(r.data.map === undefined || (record(r.data.map) && Object.values(r.data.map).every((v) => typeof v === 'string')));
+      ensure(r.data.result.every((row) => {
+        if (typeof row !== 'string') return false;
+        const fields = row.split('|');
+        return fields.length >= 34 && [2, 3, 11].every((index) => fields[index])
+          && [6, 7].every((index) => /^[A-Z]{3}$/.test(fields[index]))
+          && [8, 9].every((index) => /^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(fields[index]))
+          && /^\d{1,3}:[0-5]\d$/.test(fields[10]);
+      }));
+      cachedTicketPath = path;
+      return r;
     } catch (e) {
       lastErr = e;
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error('所有余票接口变体均失败');
+  throw lastErr;
 }
 
 /* ---------- 车次号 → train_no ---------- */
@@ -112,10 +180,11 @@ export async function searchTrainNo(trainCode: string, date: string): Promise<st
     keyword: trainCode,
     date: date.replaceAll('-', ''),
   });
-  const hit = r.data?.find(
+  ensure(Array.isArray(r.data) && r.data.every((d) => record(d) && typeof d.train_no === 'string' && d.train_no && typeof d.station_train_code === 'string' && d.station_train_code));
+  const hit = r.data.find(
     (d) => d.station_train_code.replace(/\s*[（(][^()（）]*[)）]\s*$/, '').trim().toUpperCase() === trainCode.trim().toUpperCase()
   );
-  if (!hit) throw new Error(`未查询到车次 ${trainCode}（${date}）`);
+  if (!hit) throw new CliError('TRAIN_NOT_FOUND', `未查询到车次 ${trainCode}（${date}）`);
   return hit.train_no;
 }
 
@@ -157,10 +226,10 @@ export async function queryDelay(
     },
     body: body.toString(),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from zwdch/query`);
-  const r = (await res.json()) as { status?: boolean; data?: { message?: string } };
+  if (!res.ok) throw new CliError('UPSTREAM_HTTP_ERROR');
+  const r = await readJson<{ status?: boolean; data?: { message?: string } }>(res);
   const msg = r.data?.message;
-  if (!msg) throw new Error('正晚点接口返回异常');
+  ensure(typeof msg === 'string');
   return msg; // 官方自然语言，如 "预计G3886次列车，成都东站到达时间为14:20"
 }
 
@@ -225,10 +294,15 @@ export async function queryInterline(
       purpose_codes: '00',
       channel: 'E',
     });
-    const list = r.data?.middleList ?? [];
+    const list = r.data?.middleList;
+    ensure(Array.isArray(list));
     let added = 0;
     for (const m of list) {
-      const legs = (m.fullList ?? []).map(parseTicketObject);
+      ensure(record(m) && ['all_lishi', 'start_time', 'arrive_time', 'from_station_name', 'middle_station_name', 'end_station_name', 'same_station'].every((key) => typeof m[key] === 'string'));
+      ensure(Number.isFinite(m.all_lishi_minutes) && m.all_lishi_minutes > 0);
+      ensure(Array.isArray(m.fullList) && m.fullList.length === 2 && m.fullList.every((leg) => record(leg) && ['station_train_code', 'from_station_telecode', 'to_station_telecode', 'start_time', 'arrive_time', 'lishi'].every((key) => typeof leg[key] === 'string' && leg[key])));
+      ensure(m.fullList.every((leg) => ['train_no', 'from_station_name', 'to_station_name', 'start_train_date', 'canWebBuy', 'dw_flag', 'swz_num', 'tz_num', 'zy_num', 'ze_num', 'gr_num', 'rw_num', 'srrb_num', 'yw_num', 'rz_num', 'yz_num', 'wz_num'].every((key) => leg[key] === undefined || typeof leg[key] === 'string')));
+      const legs = m.fullList.map(parseTicketObject);
       const key = legs.map((l) => `${l.code}${l.startTime}`).join('#');
       if (seen.has(key)) continue;
       seen.add(key);
@@ -266,7 +340,8 @@ export async function queryAllSaleTimes(): Promise<SaleTimeInfo[]> {
     `${API_BASE}/otn/index12306/queryAllCacheSaleTime`,
     {}
   );
-  return (r.data ?? []).map((d) => ({
+  ensure(Array.isArray(r.data) && r.data.every((d) => record(d) && typeof d.station_name === 'string' && d.station_name && typeof d.station_telecode === 'string' && d.station_telecode && (d.sale_time === undefined || typeof d.sale_time === 'string') && (d.bureau_code === undefined || typeof d.bureau_code === 'string')));
+  return r.data.map((d) => ({
     stationName: d.station_name,
     telecode: d.station_telecode,
     saleTime: d.sale_time ?? '',
@@ -280,7 +355,8 @@ export async function querySameCityStations(telecode: string): Promise<string[]>
     `${API_BASE}/otn/index12306/queryScSname`,
     { station_telecode: telecode }
   );
-  return r.data ?? [];
+  ensure(Array.isArray(r.data) && r.data.every((name) => typeof name === 'string' && name));
+  return r.data;
 }
 
 /** 列车开行/停运状态查询（POST /otn/index12306/queryTrainStatus，返回说明文本） */
@@ -289,7 +365,10 @@ export async function queryTrainStatus(trainNo: string, date: string): Promise<s
     `${API_BASE}/otn/index12306/queryTrainStatus`,
     { train_no: trainNo, train_date: date }
   );
-  return r.data?.data ?? '无数据';
+  ensure(record(r.data));
+  if (r.data.result !== undefined && r.data.result !== 'Y') throw new CliError('UPSTREAM_REJECTED');
+  ensure(typeof r.data.data === 'string');
+  return r.data.data;
 }
 
 /** 检票口查询（POST /otn/index12306/queryTicketCheck，临近开车才有数据） */
@@ -302,7 +381,9 @@ export async function queryTicketCheckGate(
     `${API_BASE}/otn/index12306/queryTicketCheck`,
     { trainDate: date, station_train_code: trainCode, from_station_telecode: fromTelecode }
   );
-  if (r.data?.result !== 'Y') throw new Error('查询失败（可能触发了滑块校验）');
+  ensure(record(r.data) && typeof r.data.result === 'string');
+  if (r.data.result !== 'Y') throw new CliError('UPSTREAM_REJECTED');
+  ensure(r.data.trainPlatform === undefined || typeof r.data.trainPlatform === 'string');
   return r.data.trainPlatform ?? '';
 }
 
@@ -316,6 +397,6 @@ export async function queryTrainRoute(
     rand_code: '',
   });
   const stops = r.data?.data;
-  if (!stops) throw new Error('未获取到经停站数据');
+  ensure(Array.isArray(stops) && stops.every((s) => record(s) && typeof s.station_name === 'string' && s.station_name && ['station_no', 'start_time', 'arrive_time', 'stopover_time'].every((key) => s[key] === undefined || typeof s[key] === 'string')));
   return stops;
 }

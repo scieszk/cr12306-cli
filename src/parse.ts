@@ -48,6 +48,8 @@ const SEAT_KEYS: Array<[string, string]> = [
   ['wz_num', '无座'],
 ];
 
+export const SEAT_NAMES = SEAT_KEYS.map(([, label]) => label);
+
 /** 中转联程 fullList 元素是已解析好的对象（非 '|' 定序串），单独解析 */
 export function parseTicketObject(o: Record<string, string>): TicketInfo {
   const seats: Record<string, string> = {};
@@ -107,8 +109,9 @@ function hhmmToMin(s: string, duration = false): number {
 }
 
 /** 是否有任意席别可订（余票为"有"或数字） */
-export function hasBookableSeat(t: TicketInfo): boolean {
-  return t.canBuy && Object.values(t.seats).some((v) => v === '有' || (/^\d+$/.test(v) && Number(v) > 0));
+export function hasBookableSeat(t: TicketInfo, seat?: string): boolean {
+  const values = seat === undefined ? Object.values(t.seats) : [t.seats[seat]];
+  return t.canBuy && values.some((v) => v === '有' || (/^\d+$/.test(v ?? '') && Number(v) > 0));
 }
 
 /**
@@ -121,24 +124,27 @@ export function joinTransfers(
   leg2List: TicketInfo[],
   minWait = 15,
   maxWait = 90,
+  options: { seat?: string; maxDuration?: number } = {},
 ): SmartTransfer[] {
   const out: SmartTransfer[] = [];
   for (const a of leg1List) {
-    if (!hasBookableSeat(a)) continue;
+    if (!hasBookableSeat(a, options.seat)) continue;
     const firstDuration = hhmmToMin(a.duration, true);
     const firstArrival = hhmmToMin(a.startTime) + firstDuration;
     // Both API queries use the same boarding date. An overnight first leg
     // would need a separate next-day query before it can safely be paired.
     if (!Number.isFinite(firstArrival) || firstDuration <= 0 || firstArrival >= 1440 || firstArrival !== hhmmToMin(a.arriveTime)) continue;
     for (const b of leg2List) {
-      if (!hasBookableSeat(b)) continue;
+      if (!hasBookableSeat(b, options.seat)) continue;
       if (!a.toTele || a.toTele !== b.fromTele) continue;
       const secondStart = hhmmToMin(b.startTime);
       const secondDuration = hhmmToMin(b.duration, true);
       if (!Number.isFinite(secondDuration) || secondDuration <= 0 || (secondStart + secondDuration) % 1440 !== hhmmToMin(b.arriveTime)) continue;
       const wait = secondStart - firstArrival;
       if (wait < 0 || wait < minWait || wait > maxWait) continue;
-      out.push({ leg1: a, leg2: b, waitMin: wait, totalMin: firstDuration + wait + secondDuration });
+      const totalMin = firstDuration + wait + secondDuration;
+      if (options.maxDuration !== undefined && totalMin > options.maxDuration) continue;
+      out.push({ leg1: a, leg2: b, waitMin: wait, totalMin });
     }
   }
   return out.sort((x, y) => x.totalMin - y.totalMin);

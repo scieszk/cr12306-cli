@@ -55,3 +55,18 @@ test('smart transfer preserves normal same-day trips and wait boundaries', () =>
   assert.deepEqual(joinTransfers([first], [second], 16), []);
   assert.deepEqual(joinTransfers([first], [second], 0, 14), []);
 });
+
+test('requested seats must be bookable on both transfer legs', () => {
+  const first = ticket({ seats: { 二等座: '有', 商务座: '0' } });
+  const second = ticket({ code: 'G2', fromTele: 'BBB', startTime: '10:30', arriveTime: '12:30', seats: { 二等座: '候补', 商务座: '有' } });
+  assert.equal(joinTransfers([first], [second]).length, 1);
+  assert.equal(hasBookableSeat(second, '二等座'), false);
+  assert.deepEqual(joinTransfers([first], [second], 15, 90, { seat: '二等座' }), []);
+  assert.deepEqual(joinTransfers([first], [second], 15, 90, { seat: '商务座' }), []);
+  assert.equal(joinTransfers([first], [{ ...second, seats: { 二等座: '2' } }], 15, 90, { seat: '二等座' }).length, 1);
+});
+test('maximum transfer duration includes both legs and waiting time, inclusively', () => {
+  const second = ticket({ code: 'G2', fromTele: 'BBB', startTime: '10:30', arriveTime: '12:30' });
+  assert.deepEqual(joinTransfers([ticket()], [second], 15, 90, { maxDuration: 269 }), []);
+  assert.equal(joinTransfers([ticket()], [second], 15, 90, { maxDuration: 270 }).length, 1);
+});

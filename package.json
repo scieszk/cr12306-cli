@@ -1,14 +1,16 @@
 {
   "name": "cr12306-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "12306 查询 CLI：余票 / 车次经停站 / 车站电报码（基于 12306 网站自用只读接口，非官方授权）",
   "type": "module",
   "bin": {
     "cr12306": "dist/cli.js"
   },
+  "files": ["dist/", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/check-help.mjs",
-    "test": "npm run build && node --test tests/api.test.mjs tests/cli.test.mjs tests/parse.test.mjs",
+    "prepack": "npm run build",
+    "test": "npm run build && node --test tests/api.test.mjs tests/cli.test.mjs tests/parse.test.mjs tests/planning.test.mjs",
     "start": "node dist/cli.js",
     "dev": "npm run build && node dist/cli.js"
   },
